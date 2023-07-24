@@ -5,7 +5,9 @@
 
 'use strict'
 
+debugger
 const newrelic = require('../../../index.js')
+const express = require('express')
 
 function greeter(name) {
   return `Hello ${name}`
