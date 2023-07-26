@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//import newrelic from './index.js'
-//import shimmer from './lib/shimmer.js'
-//import loggingModule from './lib/logger.js'
+import newrelic from './index.js'
+import shimmer from './lib/shimmer.js'
+import loggingModule from './lib/logger.js'
 import NAMES from './lib/metrics/names.js'
 import semver from 'semver'
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const isSupportedVersion = () => semver.gte(process.version, 'v16.12.0')
@@ -16,39 +17,75 @@ const isSupportedVersion = () => semver.gte(process.version, 'v16.12.0')
 const isFromEsmLoader = (context) =>
   context && context.parentURL && context.parentURL.includes('newrelic/esm-loader.mjs')
 
-//const logger = loggingModule.child({ component: 'esm-loader' })
+const logger = loggingModule.child({ component: 'esm-loader' })
 const esmShimPath = new URL('./lib/esm-shim.mjs', import.meta.url)
+const customEntryPoint = newrelic?.agent?.config?.api.esm.custom_instrumentation_entrypoint
+const __filename = fileURLToPath(import.meta.url)
 
-// TODO: do this in globalPreload
-/*
+// Hook point within agent for customers to register their custom instrumentation.
+if (customEntryPoint) {
+  const resolvedEntryPoint = path.resolve(customEntryPoint)
+  logger.debug('Registering custom ESM instrumentation at %s', resolvedEntryPoint)
+  await import(resolvedEntryPoint)
+}
+
 addESMSupportabilityMetrics(newrelic.agent)
-*/
 
 // exporting for testing purposes
 export const registeredSpecifiers = new Map()
+let preloadPort
 
-export function globalPreload() {
+// TODO: move this function to its own file so it can be used
+// in the test harness too since you cannot chain globalPreload hooks
+export function globalPreload({ port }) {
+  preloadPort = port
+
   return `
     const { createRequire } = getBuiltin('module')
     const path = getBuiltin('path')
     const { cwd } = getBuiltin('process')
-    const require = createRequire(cwd())
+    const require = createRequire(${JSON.stringify(__filename)})
     // load agent in main thread
-    const newrelic = require(cwd() + '/index.js')
-    debugger
-    const logger = require(cwd() + '/lib/logger.js')
+    const newrelic = require('./index')
+    const shimmer = require('./lib/shimmer.js')
+    const loggingModule = require('./lib/logger.js')
+    const logger = loggingModule.child({ component: 'esm-loader' })
     // Have to do this in function as top level await does not work
-    /*
-    async function loadCustomInstrumentation() {
-      const customEntryPoint = newrelic?.agent?.config?.api.esm.custom_instrumentation_entrypoint
-      // Hook point within agent for customers to register their custom instrumentation.
+    /* How to load this cuz import does not seem to work
+    const customEntryPoint = newrelic?.agent?.config?.api.esm.custom_instrumentation_entrypoint
+    // Hook point within agent for customers to register their custom instrumentation.
+    async function loadCustomEntryPoint() {
       if (customEntryPoint) {
-        const resolvedEntryPoint = path.resolve(customEntryPoint)
-        logger.debug('Registering custom ESM instrumentation at %s', resolvedEntryPoint)
-        await import(resolvedEntryPoint)
+        logger.debug('Registering custom ESM instrumentation at %s', customEntryPoint)
+        await import(customEntryPoint)
+        //require(resolvedEntryPoint)
       }
-    }*/
-  ` 
+    }
+    loadCustomEntryPoint()
+    */
+
+    port.onmessage = ({ data: { details } }) => {
+      const { specifier, resolvedModule, filePath } = details
+      const instrumentationName = shimmer.getInstrumentationNameFromModuleName(specifier)
+      const instrumentationDefinition = shimmer.registeredInstrumentations[instrumentationName]
+      if (instrumentationDefinition) {
+        // ES Modules translate import statements into fully qualified filepaths, so we create a copy of our instrumentation under this filepath
+        const instrumentationDefinitionCopy = [...instrumentationDefinition]
+
+        instrumentationDefinitionCopy.forEach((copy) => {
+          // Stripping the prefix is necessary because the code downstream gets this url without it
+          copy.moduleName = filePath 
+
+          // Added to keep our Supportability metrics from exploding/including customer info via full filepath
+          copy.specifier = specifier
+          shimmer.registerInstrumentation(copy)
+          logger.debug(
+            'Registered CommonJS instrumentation for ' + specifier + ' under ' + copy.moduleName
+          )
+        })
+      }
+    };
+    `
 }
 
 /**
@@ -66,7 +103,7 @@ export function globalPreload() {
  * @returns {Promise} Promise object representing the resolution of a given specifier
  */
 export async function resolve(specifier, context, nextResolve) {
-  if (!isSupportedVersion() || isFromEsmLoader(context)) {
+  if (!newrelic.agent || !isSupportedVersion() || isFromEsmLoader(context)) {
     return nextResolve(specifier, context, nextResolve)
   }
 
@@ -77,47 +114,25 @@ export async function resolve(specifier, context, nextResolve) {
    * duplicating the logic of the Node.js hook
    */
   const resolvedModule = await nextResolve(specifier, context, nextResolve)
-  const { pkgs, registerInstrumentation } = await import('./lib/loaded-instrumentation.js')
-  debugger
-  const instrumentationDefinition = pkgs[specifier]
-  if (instrumentationDefinition) {
-    const { url, format } = resolvedModule
-    //logger.debug(`Instrumentation exists for ${specifier} ${format} package.`)
-
-    if (registeredSpecifiers.get(url)) {
-      /*logger.debug(
-        `Instrumentation already registered for ${specifier} under ${fileURLToPath(
-          url
-        )}, skipping resolve hook...`
-      )*/
-    } else if (format === 'commonjs') {
-      // ES Modules translate import statements into fully qualified filepaths, so we create a copy of our instrumentation under this filepath
-      const instrumentationDefinitionCopy = [...instrumentationDefinition]
-
-      instrumentationDefinitionCopy.forEach((copy) => {
-        // Stripping the prefix is necessary because the code downstream gets this url without it
-        copy.moduleName = fileURLToPath(url)
-
-        // Added to keep our Supportability metrics from exploding/including customer info via full filepath
-        copy.specifier = specifier
-        registerInstrumentation(copy)
-        /*logger.debug(
-          `Registered CommonJS instrumentation for ${specifier} under ${copy.moduleName}`
-        )*/
-      })
-
-      // Keep track of what we've registered so we don't double register (see: https://github.com/newrelic/node-newrelic/issues/1646)
-      registeredSpecifiers.set(url, specifier)
-    } else if (format === 'module') {
-      registeredSpecifiers.set(url, specifier)
-      const modifiedUrl = new URL(url)
-      // add a query param to the resolved url so the load hook below knows
-      // to rewrite and wrap the source code
-      modifiedUrl.searchParams.set('hasNrInstrumentation', 'true')
-      resolvedModule.url = modifiedUrl.href
-    } else {
-      logger.debug(`${specifier} is not a CommonJS nor ESM package, skipping for now.`)
+  const { url, format } = resolvedModule
+  if (registeredSpecifiers.get(url)) {
+    logger.debug(
+      `Instrumentation already registered for ${specifier} under ${fileURLToPath(
+        url
+      )}, skipping resolve hook...`
+    )
+  } else if (format === 'module') {
+    const instrumentationName = shimmer.getInstrumentationNameFromModuleName(specifier)
+    const instrumentationDefinition = shimmer.registeredInstrumentations[instrumentationName]
+    if (instrumentationDefinition) {
+      registeredSpecifiers.set(url, { specifier, hasNrInstrumentation: true })
     }
+  } else if (format === 'commonjs') {
+    const filePath = fileURLToPath(url)
+    const details = { specifier, resolvedModule, filePath }
+    // fire and forget message to parent as it'll be updated
+    // before the loader finishes for all imports
+    preloadPort.postMessage({ details })
   }
 
   return resolvedModule
@@ -137,34 +152,17 @@ export async function resolve(specifier, context, nextResolve) {
  * @returns {Promise} Promise object representing the load of a given url
  */
 export async function load(url, context, nextLoad) {
-  if (!isSupportedVersion()) {
+  if (!newrelic.agent || !isSupportedVersion()) {
     return nextLoad(url, context, nextLoad)
   }
 
-  let parsedUrl
-
-  try {
-    parsedUrl = new URL(url)
-  } catch (err) {
-    logger.error('Unable to parse url: %s, msg: %s', url, err.message)
+  const seenUrl = registeredSpecifiers.get(url)
+  if (!seenUrl || !seenUrl.hasNrInstrumentation) {
     return nextLoad(url, context, nextLoad)
   }
 
-  const hasNrInstrumentation = parsedUrl.searchParams.get('hasNrInstrumentation')
-
-  if (!hasNrInstrumentation) {
-    return nextLoad(url, context, nextLoad)
-  }
-
-  /**
-   * undo the work we did in the resolve hook above
-   * so we can properly rewrite source and not get in an infinite loop
-   */
-  parsedUrl.searchParams.delete('hasNrInstrumentation')
-
-  const originalUrl = parsedUrl.href
-  const specifier = registeredSpecifiers.get(originalUrl)
-  const rewrittenSource = await wrapEsmSource(originalUrl, specifier)
+  const { specifier } = seenUrl
+  const rewrittenSource = await wrapEsmSource(url, specifier)
   logger.debug(`Registered module instrumentation for ${specifier}.`)
 
   return {
