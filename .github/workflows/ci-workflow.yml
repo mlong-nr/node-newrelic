@@ -115,7 +115,7 @@ jobs:
   versioned-internal:
     needs: skip_if_release
     if: needs.skip_if_release.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.ref == 'refs/heads/main' && vars.NR_RUNNER || 'ubuntu-latest' }}
 
     strategy:
       matrix:
@@ -161,7 +161,8 @@ jobs:
   versioned-external:
     needs: skip_if_release
     if: needs.skip_if_release.outputs.should_skip != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.ref == 'refs/heads/main' && vars.NR_RUNNER || 'ubuntu-latest' }}
+
 
     strategy:
       matrix:
