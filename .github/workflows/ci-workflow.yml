@@ -123,6 +123,10 @@ jobs:
         node-version: [16.x, 18.x, 20.x]
 
     steps:
+    - name: Check system, with runner ${{ vars.NR_RUNNER }}
+      run: echo "$TEST_VARS"
+      env:
+        TEST_VARS: ${{ toJSON(vars) }}
     - uses: actions/checkout@v3
     - name: Use Node.js ${{ matrix.node-version }}
       uses: actions/setup-node@v3
