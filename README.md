@@ -4,6 +4,7 @@
 [![npm status badge][1]][2] [![Server Smoke Tests][3]][4] [![Node Agent CI][5]][6] [![codecov][7]][8]
 
 This package instruments your application for performance monitoring with [New Relic](https://newrelic.com).
+test
 
 In order to take full advantage of this package, make sure you have a [New Relic account](https://newrelic.com) before starting. Available features, such as slow transaction traces, will vary [based on account level](https://newrelic.com/application-monitoring/features).
 
